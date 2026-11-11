@@ -4,19 +4,14 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "10kb" }));
 
-const PORT = process.env.PORT || 3000;
-
-const RESTAURANT_ADDRESS =
-    "22A Sretenska Street, Poltava, Ukraine";
-
-const NOMINATIM_URL =
-    "https://nominatim.openstreetmap.org/search";
-
-const OSRM_URL =
-    "https://router.project-osrm.org/route/v1/driving";
+const RESTAURANT = {
+    lat: 49.5864663,
+    lon: 34.5601613
+};
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
     .split(",")
@@ -25,114 +20,69 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 
 app.use(cors({
     origin(origin, callback) {
-        if (!origin || allowedOrigins.length === 0 ||
-            allowedOrigins.includes(origin)) {
+        if (!origin || allowedOrigins.includes(origin)) {
             return callback(null, true);
         }
-
-        return callback(new Error("Origin not allowed"));
+        callback(new Error("Origin not allowed"));
     }
 }));
 
 app.use("/api/", rateLimit({
     windowMs: 60 * 1000,
-    limit: 20,
-    standardHeaders: true,
-    legacyHeaders: false
+    limit: 20
 }));
 
 const cache = new Map();
 
 async function geocode(address) {
-    if (cache.has(address)) {
-        return cache.get(address);
-    }
+    if (cache.has(address)) return cache.get(address);
 
-    const url = new URL(NOMINATIM_URL);
-    url.searchParams.set("q", address);
+    const url = new URL(
+        "https://nominatim.openstreetmap.org/search"
+    );
+
+    url.searchParams.set("q", address + ", Полтава, Україна");
     url.searchParams.set("format", "jsonv2");
-    url.searchParams.set("addressdetails", "1");
     url.searchParams.set("limit", "1");
-    url.searchParams.set("country", "Ukraine");
-    url.searchParams.set("city", "Poltava");
+    url.searchParams.set("countrycodes", "ua");
 
     const response = await fetch(url, {
         headers: {
-            "User-Agent": "FeelingHappyDeliveryAPI/1.0"
+            "User-Agent": "FeelingHappyDelivery/1.0"
         }
     });
 
-    if (!response.ok) {
-        throw new Error("Geocoding service unavailable");
-    }
+    if (!response.ok) throw new Error("Geocoding unavailable");
 
     const results = await response.json();
-
-    if (!results.length) {
-        return null;
-    }
-
-    const result = results[0];
-    const details = result.address || {};
-
-    const city = (
-        details.city ||
-        details.town ||
-        details.municipality ||
-        details.village ||
-        ""
-    ).toLowerCase();
-
-    if (
-        details.country_code !== "ua" ||
-        !city.includes("poltava")
-    ) {
-        return null;
-    }
+    if (!results.length) return null;
 
     const point = {
-        lat: Number(result.lat),
-        lon: Number(result.lon)
+        lat: Number(results[0].lat),
+        lon: Number(results[0].lon)
     };
 
-    if (!Number.isFinite(point.lat) ||
-        !Number.isFinite(point.lon)) {
-        return null;
-    }
+    if (
+        point.lat < 49.50 || point.lat > 49.70 ||
+        point.lon < 34.40 || point.lon > 34.70
+    ) return null;
 
     cache.set(address, point);
-
     return point;
 }
 
-let restaurantPointPromise = null;
-
-function getRestaurantPoint() {
-    if (!restaurantPointPromise) {
-        restaurantPointPromise = geocode(RESTAURANT_ADDRESS);
-    }
-
-    return restaurantPointPromise;
-}
-
-async function getDrivingDistance(from, to) {
+async function getDistance(destination) {
     const url =
-        `${OSRM_URL}/${from.lon},${from.lat};${to.lon},${to.lat}` +
-        "?overview=false";
+        "https://router.project-osrm.org/route/v1/driving/" +
+        `${RESTAURANT.lon},${RESTAURANT.lat};` +
+        `${destination.lon},${destination.lat}?overview=false`;
 
     const response = await fetch(url);
-
-    if (!response.ok) {
-        throw new Error("Routing service unavailable");
-    }
+    if (!response.ok) throw new Error("Routing unavailable");
 
     const data = await response.json();
 
-    if (
-        data.code !== "Ok" ||
-        !data.routes ||
-        !data.routes.length
-    ) {
+    if (data.code !== "Ok" || !data.routes?.length) {
         throw new Error("Route not found");
     }
 
@@ -141,44 +91,20 @@ async function getDrivingDistance(from, to) {
 
 function calculateDelivery(distance, subtotal) {
     if (subtotal < 200) {
-        return {
-            allowed: false,
-            error: "Мінімальне замовлення — 200 ₴"
-        };
+        return { error: "Мінімальне замовлення — 200 ₴" };
     }
 
     if (distance > 12) {
-        return {
-            allowed: false,
-            error: "Адреса поза зоною доставки"
-        };
+        return { error: "Адреса поза зоною доставки" };
     }
 
-    let zone;
-    let fee;
+    let fee = distance <= 5 ? 105 :
+              distance <= 7 ? 115 : 125;
 
-    if (distance <= 5) {
-        zone = "До 5 км";
-        fee = 105;
-    } else if (distance <= 7) {
-        zone = "Від 5 до 7 км";
-        fee = 115;
-    } else {
-        zone = "Від 7 до 12 км";
-        fee = 125;
-    }
-
-    const freeDelivery = subtotal >= 1000;
-
-    if (freeDelivery) {
-        fee = 0;
-    }
+    if (subtotal >= 1000) fee = 0;
 
     return {
-        allowed: true,
-        zone,
-        fee,
-        freeDelivery,
+        deliveryFee: fee,
         total: subtotal + fee
     };
 }
@@ -189,25 +115,7 @@ app.get("/health", (req, res) => {
 
 app.post("/api/delivery/quote", async (req, res) => {
     try {
-        const body = req.body || {};
-
-        const forbiddenFields = [
-            "distance",
-            "distanceKm",
-            "zone",
-            "fee",
-            "deliveryFee"
-        ];
-
-        if (forbiddenFields.some(field =>
-            Object.prototype.hasOwnProperty.call(body, field)
-        )) {
-            return res.status(400).json({
-                error: "Не можна передавати відстань або тариф вручну"
-            });
-        }
-
-        const { address, subtotal } = body;
+        const { address, subtotal } = req.body || {};
 
         if (
             typeof address !== "string" ||
@@ -230,9 +138,7 @@ app.post("/api/delivery/quote", async (req, res) => {
             });
         }
 
-        const destination = await geocode(
-            `${address.trim()}, Poltava, Ukraine`
-        );
+        const destination = await geocode(address.trim());
 
         if (!destination) {
             return res.status(400).json({
@@ -240,39 +146,27 @@ app.post("/api/delivery/quote", async (req, res) => {
             });
         }
 
-        const origin = await getRestaurantPoint();
-
-        if (!origin) {
-            throw new Error("Restaurant address unavailable");
-        }
-
-        const distance = await getDrivingDistance(
-            origin,
-            destination
-        );
-
+        const distance = await getDistance(destination);
         const result = calculateDelivery(distance, subtotal);
 
-        if (!result.allowed) {
+        if (result.error) {
             return res.status(400).json({
                 error: result.error,
                 distanceKm: Number(distance.toFixed(2))
             });
         }
 
-        return res.json({
+        res.json({
             distanceKm: Number(distance.toFixed(2)),
-            zone: result.zone,
-            deliveryFee: result.fee,
-            freeDelivery: result.freeDelivery,
+            deliveryFee: result.deliveryFee,
             subtotal,
             total: result.total
         });
 
     } catch (error) {
-        console.error("Delivery quote error:", error.message);
+        console.error(error);
 
-        return res.status(503).json({
+        res.status(503).json({
             error: "Не вдалося розрахувати доставку. Спробуйте пізніше."
         });
     }
