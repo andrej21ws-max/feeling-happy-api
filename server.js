@@ -6,6 +6,9 @@ const rateLimit = require("express-rate-limit");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Настройка прокси Render
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "10kb" }));
 
 const RESTAURANT = {
@@ -33,69 +36,150 @@ app.use(cors({
 
 app.use("/api/", rateLimit({
     windowMs: 60 * 1000,
-    limit: 20
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false
 }));
 
 const cache = new Map();
 
+async function fetchWithTimeout(url, options = {}) {
+    return fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(12000)
+    });
+}
+
+// Проверка координат Полтавы
+function isInsidePoltava(point) {
+    return (
+        point.lat >= 49.50 &&
+        point.lat <= 49.70 &&
+        point.lon >= 34.40 &&
+        point.lon <= 34.70
+    );
+}
+
+// Поиск адреса через Photon с резервным Nominatim
 async function geocode(address) {
     if (cache.has(address)) {
         return cache.get(address);
     }
 
-    const url = new URL(
-        "https://nominatim.openstreetmap.org/search"
-    );
+    // Сначала пробуем Photon
+    try {
+        const photonUrl = new URL(
+            "https://photon.komoot.io/api/"
+        );
 
-    url.searchParams.set(
-        "q",
-        address + ", Полтава, Україна"
-    );
-    url.searchParams.set("format", "jsonv2");
-    url.searchParams.set("limit", "1");
-    url.searchParams.set("countrycodes", "ua");
+        photonUrl.searchParams.set(
+            "q",
+            address + ", Полтава, Україна"
+        );
 
-    const response = await fetch(url, {
-        headers: {
-            "User-Agent": "FeelingHappyDelivery/1.0"
+        photonUrl.searchParams.set("limit", "1");
+        photonUrl.searchParams.set(
+            "bbox",
+            "34.40,49.50,34.70,49.70"
+        );
+
+        const response = await fetchWithTimeout(photonUrl);
+
+        if (!response.ok) {
+            throw new Error("Photon HTTP " + response.status);
         }
-    });
 
-    if (!response.ok) {
-        throw new Error("Geocoding unavailable");
+        const data = await response.json();
+
+        if (data.features && data.features.length > 0) {
+            const coordinates =
+                data.features[0].geometry.coordinates;
+
+            const point = {
+                lon: Number(coordinates[0]),
+                lat: Number(coordinates[1])
+            };
+
+            if (isInsidePoltava(point)) {
+                cache.set(address, point);
+                return point;
+            }
+        }
+    } catch (error) {
+        console.error("Photon error:", error.message);
     }
 
-    const results = await response.json();
+    // Резервный поиск через Nominatim
+    try {
+        const nominatimUrl = new URL(
+            "https://nominatim.openstreetmap.org/search"
+        );
 
-    if (!results.length) return null;
+        nominatimUrl.searchParams.set(
+            "q",
+            address + ", Полтава, Україна"
+        );
 
-    const point = {
-        lat: Number(results[0].lat),
-        lon: Number(results[0].lon)
-    };
+        nominatimUrl.searchParams.set("format", "jsonv2");
+        nominatimUrl.searchParams.set("limit", "1");
+        nominatimUrl.searchParams.set("countrycodes", "ua");
+        nominatimUrl.searchParams.set(
+            "viewbox",
+            "34.40,49.70,34.70,49.50"
+        );
 
-    if (
-        point.lat < 49.50 || point.lat > 49.70 ||
-        point.lon < 34.40 || point.lon > 34.70
-    ) {
-        return null;
+        const response = await fetchWithTimeout(
+            nominatimUrl,
+            {
+                headers: {
+                    "User-Agent": "FeelingHappyDelivery/1.0",
+                    "Accept": "application/json"
+                }
+            }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                "Nominatim HTTP " + response.status
+            );
+        }
+
+        const results = await response.json();
+
+        if (!results.length) {
+            return null;
+        }
+
+        const point = {
+            lat: Number(results[0].lat),
+            lon: Number(results[0].lon)
+        };
+
+        if (!isInsidePoltava(point)) {
+            return null;
+        }
+
+        cache.set(address, point);
+        return point;
+
+    } catch (error) {
+        console.error("Nominatim error:", error.message);
     }
 
-    cache.set(address, point);
-
-    return point;
+    throw new Error("Both geocoding services unavailable");
 }
 
+// Расчёт расстояния
 async function getDistance(destination) {
     const url =
         "https://router.project-osrm.org/route/v1/driving/" +
         `${RESTAURANT.lon},${RESTAURANT.lat};` +
         `${destination.lon},${destination.lat}?overview=false`;
 
-    const response = await fetch(url);
+    const response = await fetchWithTimeout(url);
 
     if (!response.ok) {
-        throw new Error("Routing unavailable");
+        throw new Error("Routing HTTP " + response.status);
     }
 
     const data = await response.json();
@@ -107,6 +191,7 @@ async function getDistance(destination) {
     return data.routes[0].distance / 1000;
 }
 
+// Тарифы доставки
 function calculateDelivery(distance, subtotal) {
     if (subtotal < 200) {
         return {
@@ -120,8 +205,9 @@ function calculateDelivery(distance, subtotal) {
         };
     }
 
-    let fee = distance <= 5 ? 105 :
-              distance <= 7 ? 115 : 125;
+    let fee =
+        distance <= 5 ? 105 :
+        distance <= 7 ? 115 : 125;
 
     if (subtotal >= 1000) {
         fee = 0;
@@ -133,14 +219,14 @@ function calculateDelivery(distance, subtotal) {
     };
 }
 
-// Перевірка роботи сервера
+// Проверка сервера
 app.get("/health", (req, res) => {
     res.json({
         status: "ok"
     });
 });
 
-// Розрахунок доставки
+// Расчёт доставки
 app.post("/api/delivery/quote", async (req, res) => {
     try {
         const { address, subtotal } = req.body || {};
@@ -176,10 +262,7 @@ app.post("/api/delivery/quote", async (req, res) => {
 
         const distance = await getDistance(destination);
 
-        const result = calculateDelivery(
-            distance,
-            subtotal
-        );
+        const result = calculateDelivery(distance, subtotal);
 
         if (result.error) {
             return res.status(400).json({
@@ -196,7 +279,7 @@ app.post("/api/delivery/quote", async (req, res) => {
         });
 
     } catch (error) {
-        console.error(error);
+        console.error("Delivery quote error:", error);
 
         res.status(503).json({
             error: "Не вдалося розрахувати доставку. Спробуйте пізніше."
@@ -204,7 +287,7 @@ app.post("/api/delivery/quote", async (req, res) => {
     }
 });
 
-// Відправлення замовлення в Telegram
+// Отправка заказа в Telegram
 app.post("/api/order", async (req, res) => {
     try {
         if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -262,7 +345,6 @@ app.post("/api/order", async (req, res) => {
         }
 
         let subtotal = 0;
-
         const orderItems = [];
 
         for (const item of items) {
@@ -290,15 +372,9 @@ app.post("/api/order", async (req, res) => {
             );
         }
 
-        if (subtotal < 200) {
+        if (subtotal < 200 || subtotal > 100000) {
             return res.status(400).json({
-                error: "Мінімальне замовлення — 200 ₴"
-            });
-        }
-
-        if (subtotal > 100000) {
-            return res.status(400).json({
-                error: "Занадто велика сума замовлення"
+                error: "Некоректна сума замовлення"
             });
         }
 
@@ -312,10 +388,7 @@ app.post("/api/order", async (req, res) => {
 
         const distance = await getDistance(destination);
 
-        const delivery = calculateDelivery(
-            distance,
-            subtotal
-        );
+        const delivery = calculateDelivery(distance, subtotal);
 
         if (delivery.error) {
             return res.status(400).json({
@@ -346,7 +419,7 @@ app.post("/api/order", async (req, res) => {
             safeComment ? `📝 Коментар: ${safeComment}` : ""
         ].filter(Boolean).join("\n");
 
-        const telegramResponse = await fetch(
+        const telegramResponse = await fetchWithTimeout(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             {
                 method: "POST",
@@ -392,7 +465,5 @@ app.post("/api/order", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(
-        `Feeling Happy API running on port ${PORT}`
-    );
+    console.log(`Feeling Happy API running on port ${PORT}`);
 });
